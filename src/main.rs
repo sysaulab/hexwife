@@ -1,10 +1,11 @@
-// hx – terminal hex viewer with configurable grouping, mouse wheel, scrollbar.
-// Build: cargo add ratatui crossterm
+// hexwife 0.1.1 – terminal hex viewer with simple blocking SIMD search
+// Build: cargo add ratatui crossterm memchr
 
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
+    time::Duration,
 };
 
 use crossterm::{
@@ -12,9 +13,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode},
 };
+use memchr::memmem;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::Alignment,
+    layout::{Alignment, Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
@@ -47,20 +49,36 @@ fn read_bytes_at(file: &mut File, start: u128, len: usize) -> io::Result<Vec<u8>
 // ---------------------------------------------------------------------------
 // HexViewer state
 // ---------------------------------------------------------------------------
-const SCROLLBAR_WIDTH: usize = 2; // space + scrollbar char
+const SCROLLBAR_WIDTH: usize = 2;
+const BLOCK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB search block
+
+#[derive(PartialEq)]
+enum SearchState {
+    Inactive,
+    Prompt(String),
+    Scanning,
+    MatchFound,
+    NotFound,
+}
 
 struct HexViewer {
     file: File,
     file_size: u128,
     filename: PathBuf,
-    cursor: u128,          // absolute byte offset (0..=file_size)
-    scroll_line: u128,     // first visible line index (0‑based)
-    grouping: u8,          // 1,2,4,8
+    cursor: u128,
+    scroll_line: u128,
+    grouping: u8,
     term_cols: u16,
     term_rows: u16,
     bytes_per_line: usize,
     groups_per_line: usize,
     address_width: usize,
+    search: SearchState,
+    pattern: Vec<u8>,
+    search_matches: Vec<u128>, // offsets of matches (first one used)
+    search_offset: u128,       // next byte to scan
+    search_progress: u128,     // bytes scanned so far
+    search_tail: Vec<u8>,
 }
 
 impl HexViewer {
@@ -84,6 +102,12 @@ impl HexViewer {
             bytes_per_line: 16,
             groups_per_line: 16,
             address_width: 1,
+            search: SearchState::Inactive,
+            pattern: Vec::new(),
+            search_matches: Vec::new(),
+            search_offset: 0,
+            search_progress: 0,
+            search_tail: Vec::new(),
         })
     }
 
@@ -148,13 +172,16 @@ impl HexViewer {
         if line_of_cursor < vis_start {
             self.scroll_line = line_of_cursor;
         } else if line_of_cursor > vis_end {
-            self.scroll_line = line_of_cursor.saturating_sub(visible_rows.saturating_sub(1) as u128);
+            self.scroll_line =
+                line_of_cursor.saturating_sub(visible_rows.saturating_sub(1) as u128);
         }
         self.scroll_line = self.scroll_line.min(self.max_scroll_line());
     }
 
     fn move_cursor(&mut self, delta: i128, visible_rows: usize) {
-        let new = (self.cursor as i128 + delta).max(0).min(self.file_size as i128) as u128;
+        let new = (self.cursor as i128 + delta)
+            .max(0)
+            .min(self.file_size as i128) as u128;
         self.cursor = new;
         self.ensure_cursor_visible(visible_rows);
     }
@@ -178,20 +205,17 @@ impl HexViewer {
         self.cursor = self.file_size;
         self.ensure_cursor_visible(visible_rows);
     }
-
-    fn scroll_view(&mut self, delta_lines: i128) {
-        let visible = self.visible_rows();
-        let new_scroll = self.scroll_line as i128 + delta_lines;
-        self.scroll_line = new_scroll.max(0) as u128;
-        self.scroll_line = self.scroll_line.min(self.max_scroll_line());
-        self.ensure_cursor_visible(visible);
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Drawing helpers
 // ---------------------------------------------------------------------------
-fn highlight_hex(hex_str: &str, byte_index: usize, group_size: usize, hl_style: Style) -> Vec<Span<'static>> {
+fn highlight_hex(
+    hex_str: &str,
+    byte_index: usize,
+    group_size: usize,
+    hl_style: Style,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut group_idx = 0;
     let bytes = hex_str.as_bytes();
@@ -200,7 +224,8 @@ fn highlight_hex(hex_str: &str, byte_index: usize, group_size: usize, hl_style: 
 
     while group_start < len {
         let group_len = (group_size * 2).min(len - group_start);
-        let group_str = std::str::from_utf8(&bytes[group_start..group_start + group_len]).unwrap();
+        let group_str =
+            std::str::from_utf8(&bytes[group_start..group_start + group_len]).unwrap();
 
         if group_idx == byte_index / group_size {
             let byte_in_group = byte_index % group_size;
@@ -236,6 +261,46 @@ fn highlight_hex(hex_str: &str, byte_index: usize, group_size: usize, hl_style: 
     spans
 }
 
+fn build_highlighted_hex(
+    hex_str: &str,
+    group_size: usize,
+    highlights: Vec<(usize, Style)>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let bytes = hex_str.as_bytes();
+    let len = bytes.len();
+    let mut group_idx = 0;
+    let mut group_start = 0;
+
+    while group_start < len {
+        let group_len = (group_size * 2).min(len - group_start);
+        let group_str =
+            std::str::from_utf8(&bytes[group_start..group_start + group_len]).unwrap();
+
+        let style = highlights
+            .iter()
+            .find(|(idx, _)| *idx == group_idx)
+            .map(|(_, s)| *s);
+
+        if let Some(st) = style {
+            spans.push(Span::styled(group_str.to_string(), st));
+        } else {
+            spans.push(Span::raw(group_str.to_string()));
+        }
+
+        if group_start + group_len < len {
+            spans.push(Span::raw(" ".to_string()));
+        }
+
+        group_start += group_len;
+        if group_start < len && bytes[group_start] == b' ' {
+            group_start += 1;
+        }
+        group_idx += 1;
+    }
+    spans
+}
+
 fn format_line(
     bytes: &[u8],
     offset: u128,
@@ -245,6 +310,7 @@ fn format_line(
     cursor_offset: u128,
     hl_style: Style,
     scrollbar_char: char,
+    search_matches: &[u128],
 ) -> Line<'static> {
     let mut spans = Vec::new();
 
@@ -265,24 +331,55 @@ fn format_line(
     }
     let hex_str = hex_parts.join(" ");
 
-    let cursor_in_line = if offset <= cursor_offset && (cursor_offset - offset) < bytes_per_line as u128 {
+    // Check for cursor and search matches in this line
+    let cursor_in_line = if offset <= cursor_offset
+        && (cursor_offset - offset) < bytes_per_line as u128
+    {
         Some((cursor_offset - offset) as usize)
     } else {
         None
     };
 
+    let match_start_in_line: Option<usize> = search_matches.iter().find_map(|&m| {
+        if m >= offset && m < offset + bytes_per_line as u128 {
+            Some((m - offset) as usize)
+        } else {
+            None
+        }
+    });
+
+    let match_style = Style::default().bg(Color::Green).add_modifier(Modifier::BOLD);
+
+    let mut highlighted_groups: Vec<(usize, Style)> = Vec::new();
     if let Some(byte_idx) = cursor_in_line {
-        spans.extend(highlight_hex(&hex_str, byte_idx, group_size, hl_style));
+        highlighted_groups.push((byte_idx / group_size, hl_style));
+    }
+    if let Some(byte_idx) = match_start_in_line {
+        highlighted_groups.push((byte_idx / group_size, match_style));
+    }
+
+    if !highlighted_groups.is_empty() {
+        spans.append(&mut build_highlighted_hex(
+            &hex_str,
+            group_size,
+            highlighted_groups,
+        ));
     } else {
         spans.push(Span::raw(hex_str));
     }
 
     spans.push(Span::raw("  ".to_string()));
 
-    // ASCII column (right-aligned block, left-aligned content)
+    // ASCII column (right-aligned)
     let ascii: String = bytes
         .iter()
-        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else {
+                '.'
+            }
+        })
         .collect();
     let ascii_padded = format!("{:>width$}", ascii, width = bytes_per_line);
 
@@ -309,15 +406,24 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
     let area = f.area();
     let total_rows = area.height as usize;
 
-    let min_width = viewer.address_width + 4 + viewer.grouping as usize * 2 + viewer.grouping as usize + SCROLLBAR_WIDTH;
+    let min_width = viewer.address_width
+        + 4
+        + viewer.grouping as usize * 2
+        + viewer.grouping as usize
+        + SCROLLBAR_WIDTH;
     if area.width < min_width as u16 {
         let msg = format!(
             "Enlarge terminal to at least {} columns (grouping {}).",
-            min_width,
-            viewer.grouping
+            min_width, viewer.grouping
         );
         let p = Paragraph::new(msg).alignment(Alignment::Center);
         f.render_widget(p, area);
+        return;
+    }
+
+    // Search prompt mode
+    if matches!(viewer.search, SearchState::Prompt(_)) {
+        render_search_prompt(f, viewer, area);
         return;
     }
 
@@ -326,7 +432,7 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
     let needed_len = vis_rows * viewer.bytes_per_line;
     let file_bytes = read_bytes_at(&mut viewer.file, vis_start, needed_len).unwrap_or_default();
 
-    // Scrollbar calculations
+    // Scrollbar
     let total_logical_lines = viewer.total_lines();
     let thumb_height = if total_logical_lines == 0 {
         0.0
@@ -351,7 +457,6 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
         };
 
         if offset > viewer.file_size {
-            // Empty line past EOF
             let empty: &[u8] = &[];
             lines.push(format_line(
                 empty,
@@ -362,6 +467,7 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
                 viewer.cursor,
                 hl_style,
                 scrollbar_char,
+                &viewer.search_matches,
             ));
             continue;
         }
@@ -379,28 +485,25 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
             viewer.cursor,
             hl_style,
             scrollbar_char,
+            &viewer.search_matches,
         ));
     }
 
     // Layout
     let (hex_area, cursor_info_area, status_area) = if total_rows >= 3 {
-        let chunks = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Min(1),
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Length(1),
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
         (chunks[0], Some(chunks[1]), chunks[2])
     } else if total_rows == 2 {
-        let chunks = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Min(1),
-            ratatui::layout::Constraint::Length(1),
-        ])
-        .split(area);
+        let chunks =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         (chunks[0], None, chunks[1])
     } else {
-        let chunks = ratatui::layout::Layout::vertical([ratatui::layout::Constraint::Length(1)])
-            .split(area);
+        let chunks = Layout::vertical([Constraint::Length(1)]).split(area);
         let status = format_status(viewer);
         f.render_widget(Paragraph::new(status), chunks[0]);
         return;
@@ -410,12 +513,35 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
     f.render_widget(Paragraph::new(lines).block(hex_block), hex_area);
 
     if let Some(info_area) = cursor_info_area {
-        let word_info = word_interpretation(viewer, &file_bytes, vis_start);
-        f.render_widget(Paragraph::new(word_info).alignment(Alignment::Left), info_area);
+        if viewer.search == SearchState::Scanning || viewer.search == SearchState::MatchFound {
+            let progress = if viewer.file_size > 0 {
+                format!(
+                    "Searching... scanned {:.1}% ({} bytes)",
+                    (viewer.search_progress * 100) as f64 / viewer.file_size as f64,
+                    viewer.search_progress
+                )
+            } else {
+                "Searching...".to_string()
+            };
+            f.render_widget(Paragraph::new(progress).alignment(Alignment::Left), info_area);
+        } else {
+            let word_info = word_interpretation(viewer, &file_bytes, vis_start);
+            f.render_widget(Paragraph::new(word_info).alignment(Alignment::Left), info_area);
+        }
     }
 
     let status = format_status(viewer);
     f.render_widget(Paragraph::new(status).alignment(Alignment::Left), status_area);
+}
+
+fn render_search_prompt(f: &mut ratatui::Frame, viewer: &HexViewer, area: ratatui::layout::Rect) {
+    let prompt = if let SearchState::Prompt(ref input) = viewer.search {
+        format!("/{}", input)
+    } else {
+        "/".to_string()
+    };
+    let p = Paragraph::new(prompt).alignment(Alignment::Left);
+    f.render_widget(p, area);
 }
 
 fn format_status(viewer: &HexViewer) -> String {
@@ -431,13 +557,18 @@ fn format_status(viewer: &HexViewer) -> String {
         100
     };
     format!(
-        " {}  {:X}  L{}/{}  {}%  [{}b]",
+        " {}  {:X}  L{}/{}  {}%  [{}b]{}",
         viewer.filename.display(),
         viewer.cursor,
         line + 1,
         total,
         pct,
-        viewer.grouping
+        viewer.grouping,
+        match viewer.search {
+            SearchState::MatchFound => " - Match found",
+            SearchState::NotFound => " - Not found",
+            _ => "",
+        }
     )
 }
 
@@ -448,19 +579,17 @@ fn word_interpretation(viewer: &HexViewer, buffer: &[u8], vis_start: u128) -> St
         return String::new();
     }
 
-    // Align cursor to the start of the group it belongs to
     let aligned = cursor - (cursor % grouping);
     if aligned + grouping > viewer.file_size {
-        return String::new(); // not enough bytes for a complete group
+        return String::new();
     }
 
-    // Check if the aligned group is inside the currently visible buffer
     if aligned < vis_start {
-        return String::new(); // group starts before visible window (shouldn't happen if cursor visible)
+        return String::new();
     }
     let pos_in_buf = (aligned - vis_start) as usize;
     if pos_in_buf + (grouping as usize) > buffer.len() {
-        return String::new(); // group not fully in buffer (shouldn't happen)
+        return String::new();
     }
 
     let data = &buffer[pos_in_buf..pos_in_buf + grouping as usize];
@@ -487,6 +616,101 @@ fn word_interpretation(viewer: &HexViewer, buffer: &[u8], vis_start: u128) -> St
         }
         _ => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Search (blocking, single thread, cancellable)
+// ---------------------------------------------------------------------------
+fn parse_search_pattern(input: &str) -> Option<Vec<u8>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if input.starts_with('"') && input.ends_with('"') && input.len() >= 2 {
+        let ascii = &input[1..input.len() - 1];
+        if ascii.is_ascii() {
+            return Some(ascii.as_bytes().to_vec());
+        }
+    }
+    // Try hex parsing (allow whitespace)
+    let hex_str: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if hex_str.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..hex_str.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
+        .collect::<Result<Vec<u8>, _>>()
+        .ok()?;
+    Some(bytes)
+}
+
+/// Run one search block. Returns `true` if a match was found (cursor updated), `false` if done or cancelled.
+fn search_step(viewer: &mut HexViewer) -> bool {
+    if viewer.search_offset >= viewer.file_size {
+        viewer.search = SearchState::NotFound;
+        return false;
+    }
+
+    let overlap = if viewer.pattern.is_empty() {
+        0
+    } else {
+        viewer.pattern.len() - 1
+    };
+    let block_len = BLOCK_SIZE.min((viewer.file_size - viewer.search_offset) as usize);
+
+    // Read the block
+    let bytes = match read_bytes_at(&mut viewer.file, viewer.search_offset, block_len) {
+        Ok(b) => b,
+        Err(_) => {
+            viewer.search = SearchState::NotFound;
+            return false;
+        }
+    };
+    let bytes_len = bytes.len();
+    if bytes_len == 0 {
+        viewer.search = SearchState::NotFound;
+        return false;
+    }
+
+    // Build combined haystack: previous tail + new bytes
+    let mut haystack = viewer.search_tail.clone();
+    haystack.extend_from_slice(&bytes);
+
+    let finder = memmem::Finder::new(&viewer.pattern);
+    let matches: Vec<u128> = finder
+        .find_iter(&haystack)
+        .map(|pos| viewer.search_offset - viewer.search_tail.len() as u128 + pos as u128)
+        .collect();
+
+    // Progress update
+    viewer.search_progress += bytes_len as u128;
+
+    // Update tail for next block
+    if bytes_len >= overlap {
+        viewer.search_tail = bytes[bytes_len - overlap..].to_vec();
+    } else {
+        // Keep the tail plus whatever we have (shouldn't happen for valid searches)
+        viewer.search_tail.extend_from_slice(&bytes);
+        viewer.search_tail = viewer.search_tail[viewer.search_tail.len().saturating_sub(overlap)..].to_vec();
+    }
+
+    // Advance search offset
+    viewer.search_offset += bytes_len as u128;
+
+    if !matches.is_empty() {
+        viewer.cursor = matches[0];
+        viewer.search_matches = matches;
+        viewer.search = SearchState::MatchFound;
+        viewer.ensure_cursor_visible(viewer.visible_rows());
+        return true;
+    }
+
+    if viewer.search_offset >= viewer.file_size {
+        viewer.search = SearchState::NotFound;
+        return false;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -519,56 +743,118 @@ fn main() -> io::Result<()> {
         .add_modifier(Modifier::BOLD);
 
     loop {
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Process events
+        if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
-                    match key.code {
-                        KeyCode::Char('q') => break,
-                        KeyCode::Up => viewer.move_cursor(-(viewer.bytes_per_line as i128), viewer.visible_rows()),
-                        KeyCode::Down => viewer.move_cursor(viewer.bytes_per_line as i128, viewer.visible_rows()),
-                        KeyCode::Left => viewer.move_cursor(-1, viewer.visible_rows()),
-                        KeyCode::Right => viewer.move_cursor(1, viewer.visible_rows()),
-
-                        // Grouping
-                        KeyCode::Char('1') => {
-                            viewer.grouping = 1;
-                            viewer.recalc_layout();
-                            viewer.scroll_line = viewer.cursor / viewer.bytes_per_line as u128;
-                            viewer.ensure_cursor_visible(viewer.visible_rows());
+                    match viewer.search {
+                        SearchState::Prompt(ref mut input) => {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    viewer.search = SearchState::Inactive;
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(pat) = parse_search_pattern(input) {
+                                        if pat.is_empty() {
+                                            viewer.search = SearchState::Inactive;
+                                        } else {
+                                            viewer.search_tail.clear();
+                                            viewer.pattern = pat;
+                                            viewer.search_offset = viewer.cursor + 1;
+                                            viewer.search_progress = 0;
+                                            viewer.search_matches.clear();
+                                            viewer.search = SearchState::Scanning;
+                                        }
+                                    } else {
+                                        // Invalid pattern, cancel
+                                        viewer.search = SearchState::Inactive;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    input.push(c);
+                                }
+                                KeyCode::Backspace => {
+                                    input.pop();
+                                }
+                                _ => {}
+                            }
                         }
-                        KeyCode::Char('2') => {
-                            viewer.grouping = 2;
-                            viewer.recalc_layout();
-                            viewer.scroll_line = viewer.cursor / viewer.bytes_per_line as u128;
-                            viewer.ensure_cursor_visible(viewer.visible_rows());
+                        SearchState::Scanning => {
+                            if key.code == KeyCode::Esc {
+                                viewer.search = SearchState::Inactive;
+                            }
                         }
-                        KeyCode::Char('3') => {
-                            viewer.grouping = 4;
-                            viewer.recalc_layout();
-                            viewer.scroll_line = viewer.cursor / viewer.bytes_per_line as u128;
-                            viewer.ensure_cursor_visible(viewer.visible_rows());
+                        SearchState::MatchFound | SearchState::NotFound => {
+                            // Any key dismisses result
+                            viewer.search = SearchState::Inactive;
+                            viewer.search_matches.clear();
                         }
-                        KeyCode::Char('4') => {
-                            viewer.grouping = 8;
-                            viewer.recalc_layout();
-                            viewer.scroll_line = viewer.cursor / viewer.bytes_per_line as u128;
-                            viewer.ensure_cursor_visible(viewer.visible_rows());
+                        SearchState::Inactive => {
+                            match key.code {
+                                KeyCode::Char('q') => break,
+                                KeyCode::Up => viewer.move_cursor(
+                                    -(viewer.bytes_per_line as i128),
+                                    viewer.visible_rows(),
+                                ),
+                                KeyCode::Down => viewer.move_cursor(
+                                    viewer.bytes_per_line as i128,
+                                    viewer.visible_rows(),
+                                ),
+                                KeyCode::Left => viewer.move_cursor(-1, viewer.visible_rows()),
+                                KeyCode::Right => viewer.move_cursor(1, viewer.visible_rows()),
+                                KeyCode::Char('s') => viewer.go_home(viewer.visible_rows()),
+                                KeyCode::Char('e') => viewer.go_end(viewer.visible_rows()),
+                                KeyCode::Char('u') => viewer.page_up(viewer.visible_rows()),
+                                KeyCode::Char('d') => viewer.page_down(viewer.visible_rows()),
+                                KeyCode::Char('1') => {
+                                    viewer.grouping = 1;
+                                    viewer.recalc_layout();
+                                    viewer.scroll_line =
+                                        viewer.cursor / viewer.bytes_per_line as u128;
+                                    viewer.ensure_cursor_visible(viewer.visible_rows());
+                                }
+                                KeyCode::Char('2') => {
+                                    viewer.grouping = 2;
+                                    viewer.recalc_layout();
+                                    viewer.scroll_line =
+                                        viewer.cursor / viewer.bytes_per_line as u128;
+                                    viewer.ensure_cursor_visible(viewer.visible_rows());
+                                }
+                                KeyCode::Char('3') => {
+                                    viewer.grouping = 4;
+                                    viewer.recalc_layout();
+                                    viewer.scroll_line =
+                                        viewer.cursor / viewer.bytes_per_line as u128;
+                                    viewer.ensure_cursor_visible(viewer.visible_rows());
+                                }
+                                KeyCode::Char('4') => {
+                                    viewer.grouping = 8;
+                                    viewer.recalc_layout();
+                                    viewer.scroll_line =
+                                        viewer.cursor / viewer.bytes_per_line as u128;
+                                    viewer.ensure_cursor_visible(viewer.visible_rows());
+                                }
+                                KeyCode::Char('/') => {
+                                    viewer.search = SearchState::Prompt(String::new());
+                                }
+                                _ => {}
+                            }
                         }
-
-                        // Navigation remapped
-                        KeyCode::Char('s') => viewer.go_home(viewer.visible_rows()),     // start
-                        KeyCode::Char('e') => viewer.go_end(viewer.visible_rows()),      // end
-                        KeyCode::Char('u') => viewer.page_up(viewer.visible_rows()),     // page up
-                        KeyCode::Char('d') => viewer.page_down(viewer.visible_rows()),   // page down
-
-                        _ => {}
                     }
                 }
                 Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollDown => viewer.scroll_view(1),
-                        MouseEventKind::ScrollUp => viewer.scroll_view(-1),
-                        _ => {}
+                    if viewer.search == SearchState::Inactive {
+                        match mouse.kind {
+                            MouseEventKind::ScrollDown => viewer.move_cursor(
+                                viewer.bytes_per_line as i128,
+                                viewer.visible_rows(),
+                            ),
+                            MouseEventKind::ScrollUp => viewer.move_cursor(
+                                -(viewer.bytes_per_line as i128),
+                                viewer.visible_rows(),
+                            ),
+                            _ => {}
+                        }
                     }
                 }
                 Event::Resize(cols, rows) => {
@@ -578,6 +864,14 @@ fn main() -> io::Result<()> {
                     viewer.ensure_cursor_visible(viewer.visible_rows());
                 }
                 _ => {}
+            }
+        }
+
+        // Run one search step if scanning (this is blocking but we poll between blocks)
+        if viewer.search == SearchState::Scanning {
+            if !search_step(&mut viewer) {
+                // search ended (found or not)
+                // state already updated
             }
         }
 
