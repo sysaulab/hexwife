@@ -1,1 +1,6 @@
 /target
+src/main_0.1.0.rs
+small.bin
+medium.bin
+large.bin
+.DS_Store
