@@ -1,10 +1,9 @@
 # HexWife
 
-Simple hexadecimal viewer, internally uses 128 bit computation for display ranges and other related affairs. 
+Simple hexadecimal viewer, internally uses 128 bit computation for display ranges and other related affairs. Used to verify OS's compliances with very large files using generative filesystems capable of serving file content up to the limit. 
 
-This insure proper behaviour and support even with the wildest file.
+Tested up to 9 EXA-Bytes...
 
-Tested with a generative file system serving a 9eb file.
 
 # Licenced under GPL3
 

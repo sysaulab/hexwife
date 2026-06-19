@@ -1,11 +1,11 @@
-// hexwife 0.1.1 – terminal hex viewer with simple blocking SIMD search
+// hexwife 0.1.1 – terminal hex viewer with ETA, proper search UI, and error reporting
 // Build: cargo add ratatui crossterm memchr
 
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::PathBuf,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -16,7 +16,7 @@ use crossterm::{
 use memchr::memmem;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
@@ -75,10 +75,12 @@ struct HexViewer {
     address_width: usize,
     search: SearchState,
     pattern: Vec<u8>,
-    search_matches: Vec<u128>, // offsets of matches (first one used)
-    search_offset: u128,       // next byte to scan
-    search_progress: u128,     // bytes scanned so far
+    search_matches: Vec<u128>,
+    search_offset: u128,
+    search_progress: u128,
     search_tail: Vec<u8>,
+    search_start: Option<Instant>,
+    search_error: Option<String>,
 }
 
 impl HexViewer {
@@ -108,6 +110,8 @@ impl HexViewer {
             search_offset: 0,
             search_progress: 0,
             search_tail: Vec::new(),
+            search_start: None,
+            search_error: None,
         })
     }
 
@@ -331,7 +335,6 @@ fn format_line(
     }
     let hex_str = hex_parts.join(" ");
 
-    // Check for cursor and search matches in this line
     let cursor_in_line = if offset <= cursor_offset
         && (cursor_offset - offset) < bytes_per_line as u128
     {
@@ -421,18 +424,127 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
         return;
     }
 
-    // Search prompt mode
-    if matches!(viewer.search, SearchState::Prompt(_)) {
-        render_search_prompt(f, viewer, area);
+    // Extract search prompt input early to avoid borrow conflict
+    let search_input = if let SearchState::Prompt(ref input) = viewer.search {
+        Some(input.clone())
+    } else {
+        None
+    };
+
+    if let Some(input) = search_input {
+        if total_rows < 4 {
+            let msg = "Terminal too small for search. Enlarge to at least 4 rows.";
+            f.render_widget(Paragraph::new(msg).alignment(Alignment::Center), area);
+            return;
+        }
+
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let hex_area = chunks[0];
+        let search_panel_area = chunks[1];
+        let status_area = chunks[2];
+
+        let vis_rows = hex_area.height as usize;
+        render_hex(f, viewer, hl_style, vis_rows, hex_area);
+        render_search_panel(f, viewer, &input, search_panel_area);
+        let status = format_status(viewer);
+        f.render_widget(Paragraph::new(status).alignment(Alignment::Left), status_area);
         return;
     }
 
+    // Normal mode (including scanning, match found, etc.)
     let vis_rows = viewer.visible_rows();
+    let (hex_area, info_area_opt, status_area) = layout_normal(area, total_rows);
+    render_hex(f, viewer, hl_style, vis_rows, hex_area);
+    if let Some(info_area) = info_area_opt {
+        if viewer.search == SearchState::Scanning || viewer.search == SearchState::MatchFound {
+            let progress = if viewer.file_size > 0 {
+                let pct = (viewer.search_progress * 100) as f64 / viewer.file_size as f64;
+                let eta = if let Some(start) = viewer.search_start {
+                    let elapsed = start.elapsed();
+                    let remaining = viewer.file_size - viewer.search_offset;
+                    format_eta(elapsed, viewer.search_progress, remaining)
+                } else {
+                    String::new()
+                };
+                format!("Searching... {:.1}%  {}", pct, eta)
+            } else {
+                "Searching...".to_string()
+            };
+            f.render_widget(Paragraph::new(progress).alignment(Alignment::Left), info_area);
+        } else {
+            let vis_start = viewer.scroll_line * viewer.bytes_per_line as u128;
+            let needed_len = vis_rows * viewer.bytes_per_line;
+            let file_bytes =
+                read_bytes_at(&mut viewer.file, vis_start, needed_len).unwrap_or_default();
+            let word_info = word_interpretation(viewer, &file_bytes, vis_start);
+            f.render_widget(Paragraph::new(word_info).alignment(Alignment::Left), info_area);
+        }
+    }
+    let status = format_status(viewer);
+    f.render_widget(Paragraph::new(status).alignment(Alignment::Left), status_area);
+}
+
+fn render_search_panel(
+    f: &mut ratatui::Frame,
+    viewer: &HexViewer,
+    input: &str,
+    area: Rect,
+) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    let prompt_area = chunks[0];
+    let help_area = chunks[1];
+
+    // Prompt line: "/" + input + optional error
+    let mut prompt_spans = vec![Span::raw("/")];
+    prompt_spans.push(Span::raw(input.to_string()));
+    if let Some(ref err) = viewer.search_error {
+        prompt_spans.push(Span::styled(
+            format!(" {}", err),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(prompt_spans)), prompt_area);
+
+    // Help line
+    let help_text = "Hex: 48 65 6C 6C 6F   ASCII: \"Hello\"";
+    f.render_widget(Paragraph::new(help_text), help_area);
+}
+
+fn layout_normal(area: Rect, total_rows: usize) -> (Rect, Option<Rect>, Rect) {
+    if total_rows >= 3 {
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        (chunks[0], Some(chunks[1]), chunks[2])
+    } else if total_rows == 2 {
+        let chunks =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+        (chunks[0], None, chunks[1])
+    } else {
+        let chunks = Layout::vertical([Constraint::Length(1)]).split(area);
+        (chunks[0], None, chunks[0]) // status fills whole area
+    }
+}
+
+fn render_hex(
+    f: &mut ratatui::Frame,
+    viewer: &mut HexViewer,
+    hl_style: Style,
+    vis_rows: usize,
+    area: Rect,
+) {
     let vis_start = viewer.scroll_line * viewer.bytes_per_line as u128;
     let needed_len = vis_rows * viewer.bytes_per_line;
     let file_bytes = read_bytes_at(&mut viewer.file, vis_start, needed_len).unwrap_or_default();
 
-    // Scrollbar
     let total_logical_lines = viewer.total_lines();
     let thumb_height = if total_logical_lines == 0 {
         0.0
@@ -489,59 +601,8 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
         ));
     }
 
-    // Layout
-    let (hex_area, cursor_info_area, status_area) = if total_rows >= 3 {
-        let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        (chunks[0], Some(chunks[1]), chunks[2])
-    } else if total_rows == 2 {
-        let chunks =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-        (chunks[0], None, chunks[1])
-    } else {
-        let chunks = Layout::vertical([Constraint::Length(1)]).split(area);
-        let status = format_status(viewer);
-        f.render_widget(Paragraph::new(status), chunks[0]);
-        return;
-    };
-
     let hex_block = Block::default();
-    f.render_widget(Paragraph::new(lines).block(hex_block), hex_area);
-
-    if let Some(info_area) = cursor_info_area {
-        if viewer.search == SearchState::Scanning || viewer.search == SearchState::MatchFound {
-            let progress = if viewer.file_size > 0 {
-                format!(
-                    "Searching... scanned {:.1}% ({} bytes)",
-                    (viewer.search_progress * 100) as f64 / viewer.file_size as f64,
-                    viewer.search_progress
-                )
-            } else {
-                "Searching...".to_string()
-            };
-            f.render_widget(Paragraph::new(progress).alignment(Alignment::Left), info_area);
-        } else {
-            let word_info = word_interpretation(viewer, &file_bytes, vis_start);
-            f.render_widget(Paragraph::new(word_info).alignment(Alignment::Left), info_area);
-        }
-    }
-
-    let status = format_status(viewer);
-    f.render_widget(Paragraph::new(status).alignment(Alignment::Left), status_area);
-}
-
-fn render_search_prompt(f: &mut ratatui::Frame, viewer: &HexViewer, area: ratatui::layout::Rect) {
-    let prompt = if let SearchState::Prompt(ref input) = viewer.search {
-        format!("/{}", input)
-    } else {
-        "/".to_string()
-    };
-    let p = Paragraph::new(prompt).alignment(Alignment::Left);
-    f.render_widget(p, area);
+    f.render_widget(Paragraph::new(lines).block(hex_block), area);
 }
 
 fn format_status(viewer: &HexViewer) -> String {
@@ -619,33 +680,41 @@ fn word_interpretation(viewer: &HexViewer, buffer: &[u8], vis_start: u128) -> St
 }
 
 // ---------------------------------------------------------------------------
-// Search (blocking, single thread, cancellable)
+// Search helpers
 // ---------------------------------------------------------------------------
-fn parse_search_pattern(input: &str) -> Option<Vec<u8>> {
+fn parse_search_pattern(input: &str) -> Result<Vec<u8>, String> {
     let input = input.trim();
     if input.is_empty() {
-        return None;
+        return Err("empty pattern".to_string());
     }
     if input.starts_with('"') && input.ends_with('"') && input.len() >= 2 {
         let ascii = &input[1..input.len() - 1];
         if ascii.is_ascii() {
-            return Some(ascii.as_bytes().to_vec());
+            return Ok(ascii.as_bytes().to_vec());
+        } else {
+            return Err("ASCII string contains non-ASCII characters".to_string());
         }
     }
-    // Try hex parsing (allow whitespace)
+    // Hex parsing
     let hex_str: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     if hex_str.len() % 2 != 0 {
-        return None;
+        return Err("hex string must have an even number of digits".to_string());
     }
-    let bytes = (0..hex_str.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .ok()?;
-    Some(bytes)
+    let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+    for i in (0..hex_str.len()).step_by(2) {
+        match u8::from_str_radix(&hex_str[i..i + 2], 16) {
+            Ok(b) => bytes.push(b),
+            Err(_) => {
+                return Err(format!(
+                    "invalid hex digit '{}'",
+                    hex_str.chars().nth(i).unwrap()
+                ));
+            }
+        }
+    }
+    Ok(bytes)
 }
 
-/// Run one search block. Returns `true` if a match was found (cursor updated), `false` if done or cancelled.
 fn search_step(viewer: &mut HexViewer) -> bool {
     if viewer.search_offset >= viewer.file_size {
         viewer.search = SearchState::NotFound;
@@ -659,7 +728,6 @@ fn search_step(viewer: &mut HexViewer) -> bool {
     };
     let block_len = BLOCK_SIZE.min((viewer.file_size - viewer.search_offset) as usize);
 
-    // Read the block
     let bytes = match read_bytes_at(&mut viewer.file, viewer.search_offset, block_len) {
         Ok(b) => b,
         Err(_) => {
@@ -673,7 +741,6 @@ fn search_step(viewer: &mut HexViewer) -> bool {
         return false;
     }
 
-    // Build combined haystack: previous tail + new bytes
     let mut haystack = viewer.search_tail.clone();
     haystack.extend_from_slice(&bytes);
 
@@ -683,19 +750,15 @@ fn search_step(viewer: &mut HexViewer) -> bool {
         .map(|pos| viewer.search_offset - viewer.search_tail.len() as u128 + pos as u128)
         .collect();
 
-    // Progress update
     viewer.search_progress += bytes_len as u128;
 
-    // Update tail for next block
     if bytes_len >= overlap {
         viewer.search_tail = bytes[bytes_len - overlap..].to_vec();
     } else {
-        // Keep the tail plus whatever we have (shouldn't happen for valid searches)
         viewer.search_tail.extend_from_slice(&bytes);
         viewer.search_tail = viewer.search_tail[viewer.search_tail.len().saturating_sub(overlap)..].to_vec();
     }
 
-    // Advance search offset
     viewer.search_offset += bytes_len as u128;
 
     if !matches.is_empty() {
@@ -711,6 +774,33 @@ fn search_step(viewer: &mut HexViewer) -> bool {
         return false;
     }
     true
+}
+
+fn format_eta(elapsed: Duration, bytes_scanned: u128, remaining: u128) -> String {
+    if remaining == 0 {
+        return "ETA: done".to_string();
+    }
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs == 0.0 || bytes_scanned == 0 {
+        return "ETA: calculating...".to_string();
+    }
+    let rate = bytes_scanned as f64 / elapsed_secs;
+    let eta_secs = remaining as f64 / rate;
+    let total_secs = eta_secs as u64;
+
+    let years = total_secs / (365 * 24 * 3600);
+    let days = (total_secs % (365 * 24 * 3600)) / (24 * 3600);
+    let hours = (total_secs % (24 * 3600)) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    let mut parts = Vec::new();
+    if years > 0 { parts.push(format!("{}y", years)); }
+    if days > 0 { parts.push(format!("{}d", days)); }
+    if hours > 0 { parts.push(format!("{}h", hours)); }
+    if minutes > 0 { parts.push(format!("{}m", minutes)); }
+    parts.push(format!("{}s", seconds));
+    format!("ETA: {}", parts.join(" "))
 }
 
 // ---------------------------------------------------------------------------
@@ -743,7 +833,6 @@ fn main() -> io::Result<()> {
         .add_modifier(Modifier::BOLD);
 
     loop {
-        // Process events
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
@@ -752,29 +841,32 @@ fn main() -> io::Result<()> {
                             match key.code {
                                 KeyCode::Esc => {
                                     viewer.search = SearchState::Inactive;
+                                    viewer.search_error = None;
                                 }
                                 KeyCode::Enter => {
-                                    if let Some(pat) = parse_search_pattern(input) {
-                                        if pat.is_empty() {
-                                            viewer.search = SearchState::Inactive;
-                                        } else {
-                                            viewer.search_tail.clear();
+                                    match parse_search_pattern(input) {
+                                        Ok(pat) => {
                                             viewer.pattern = pat;
                                             viewer.search_offset = viewer.cursor + 1;
                                             viewer.search_progress = 0;
                                             viewer.search_matches.clear();
+                                            viewer.search_tail.clear();
+                                            viewer.search_start = Some(Instant::now());
+                                            viewer.search_error = None;
                                             viewer.search = SearchState::Scanning;
                                         }
-                                    } else {
-                                        // Invalid pattern, cancel
-                                        viewer.search = SearchState::Inactive;
+                                        Err(err) => {
+                                            viewer.search_error = Some(err);
+                                        }
                                     }
                                 }
                                 KeyCode::Char(c) => {
                                     input.push(c);
+                                    viewer.search_error = None; // clear error on new input
                                 }
                                 KeyCode::Backspace => {
                                     input.pop();
+                                    viewer.search_error = None;
                                 }
                                 _ => {}
                             }
@@ -782,12 +874,14 @@ fn main() -> io::Result<()> {
                         SearchState::Scanning => {
                             if key.code == KeyCode::Esc {
                                 viewer.search = SearchState::Inactive;
+                                viewer.search_start = None;
                             }
                         }
                         SearchState::MatchFound | SearchState::NotFound => {
-                            // Any key dismisses result
                             viewer.search = SearchState::Inactive;
                             viewer.search_matches.clear();
+                            viewer.search_start = None;
+                            viewer.search_error = None;
                         }
                         SearchState::Inactive => {
                             match key.code {
@@ -867,11 +961,9 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Run one search step if scanning (this is blocking but we poll between blocks)
         if viewer.search == SearchState::Scanning {
             if !search_step(&mut viewer) {
-                // search ended (found or not)
-                // state already updated
+                viewer.search_start = None;
             }
         }
 
