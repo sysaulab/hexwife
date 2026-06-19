@@ -214,7 +214,7 @@ impl HexViewer {
 // ---------------------------------------------------------------------------
 // Drawing helpers
 // ---------------------------------------------------------------------------
-fn highlight_hex(
+fn _highlight_hex(
     hex_str: &str,
     byte_index: usize,
     group_size: usize,
