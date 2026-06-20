@@ -1,6 +1,6 @@
 [package]
 name = "hexwife"
-version = "0.1.2"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -8,3 +8,6 @@ ratatui = "0.30.2"
 crossterm = "0.29.0"
 memchr = "2.7"
 regex = "1"
+toml = "1.1.0"
+env = "1"
+serde = { version = "1", features = ["derive"] }

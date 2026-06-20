@@ -2,6 +2,8 @@
 
 Simple hexadecimal viewer started as a pun. It internally uses 128 bit for display ranges and other related computations. Used to verify OS's compliances with very large files using generative filesystems capable of serving file content up to the limit. Or just for giggle...
 
+Added editing feature. Spacebar allow editing of hex value at the cursor.
+
 Tested up to 9 *EXA*-Bytes...
 
 
