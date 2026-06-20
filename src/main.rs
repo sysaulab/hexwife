@@ -1,5 +1,5 @@
-// hexwife 0.1.1 – terminal hex viewer with ETA, proper search UI, and error reporting
-// Build: cargo add ratatui crossterm memchr
+// hexwife 0.2.0 – terminal hex viewer with regex search
+// Build: cargo add ratatui crossterm memchr regex
 
 use std::{
     fs::File,
@@ -14,6 +14,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode},
 };
 use memchr::memmem;
+use regex::bytes::Regex;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -51,6 +52,7 @@ fn read_bytes_at(file: &mut File, start: u128, len: usize) -> io::Result<Vec<u8>
 // ---------------------------------------------------------------------------
 const SCROLLBAR_WIDTH: usize = 2;
 const BLOCK_SIZE: usize = 16 * 1024 * 1024; // 16 MiB search block
+const MAX_REGEX_OVERLAP: usize = 4096; // conservative overlap for regex matching
 
 #[derive(PartialEq)]
 enum SearchState {
@@ -59,6 +61,11 @@ enum SearchState {
     Scanning,
     MatchFound,
     NotFound,
+}
+
+enum SearchPattern {
+    Exact(Vec<u8>),
+    Regex(Regex),
 }
 
 struct HexViewer {
@@ -74,7 +81,7 @@ struct HexViewer {
     groups_per_line: usize,
     address_width: usize,
     search: SearchState,
-    pattern: Vec<u8>,
+    pattern: Option<SearchPattern>,
     search_matches: Vec<u128>,
     search_offset: u128,
     search_progress: u128,
@@ -105,7 +112,7 @@ impl HexViewer {
             groups_per_line: 16,
             address_width: 1,
             search: SearchState::Inactive,
-            pattern: Vec::new(),
+            pattern: None,
             search_matches: Vec::new(),
             search_offset: 0,
             search_progress: 0,
@@ -461,7 +468,7 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
     let (hex_area, info_area_opt, status_area) = layout_normal(area, total_rows);
     render_hex(f, viewer, hl_style, vis_rows, hex_area);
     if let Some(info_area) = info_area_opt {
-        if viewer.search == SearchState::Scanning || viewer.search == SearchState::MatchFound {
+        if viewer.search == SearchState::Scanning {
             let progress = if viewer.file_size > 0 {
                 let pct = (viewer.search_progress * 100) as f64 / viewer.file_size as f64;
                 let eta = if let Some(start) = viewer.search_start {
@@ -476,6 +483,13 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
                 "Searching...".to_string()
             };
             f.render_widget(Paragraph::new(progress).alignment(Alignment::Left), info_area);
+        } else if viewer.search == SearchState::MatchFound {
+            let msg = if let Some(first) = viewer.search_matches.first() {
+                format!("Match found at offset {:X} ({} matches total)", first, viewer.search_matches.len())
+            } else {
+                "Match found".to_string()
+            };
+            f.render_widget(Paragraph::new(msg).alignment(Alignment::Left), info_area);
         } else {
             let vis_start = viewer.scroll_line * viewer.bytes_per_line as u128;
             let needed_len = vis_rows * viewer.bytes_per_line;
@@ -487,32 +501,6 @@ fn draw_ui(f: &mut ratatui::Frame, viewer: &mut HexViewer, hl_style: Style) {
     }
     let status = format_status(viewer);
     f.render_widget(Paragraph::new(status).alignment(Alignment::Left), status_area);
-}
-
-fn render_search_panel(
-    f: &mut ratatui::Frame,
-    viewer: &HexViewer,
-    input: &str,
-    area: Rect,
-) {
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-    let prompt_area = chunks[0];
-    let help_area = chunks[1];
-
-    // Prompt line: "/" + input + optional error
-    let mut prompt_spans = vec![Span::raw("/")];
-    prompt_spans.push(Span::raw(input.to_string()));
-    if let Some(ref err) = viewer.search_error {
-        prompt_spans.push(Span::styled(
-            format!(" {}", err),
-            Style::default().fg(Color::Red),
-        ));
-    }
-    f.render_widget(Paragraph::new(Line::from(prompt_spans)), prompt_area);
-
-    // Help line
-    let help_text = "Hex: 48 65 6C 6C 6F   ASCII: \"Hello\"";
-    f.render_widget(Paragraph::new(help_text), help_area);
 }
 
 fn layout_normal(area: Rect, total_rows: usize) -> (Rect, Option<Rect>, Rect) {
@@ -530,7 +518,7 @@ fn layout_normal(area: Rect, total_rows: usize) -> (Rect, Option<Rect>, Rect) {
         (chunks[0], None, chunks[1])
     } else {
         let chunks = Layout::vertical([Constraint::Length(1)]).split(area);
-        (chunks[0], None, chunks[0]) // status fills whole area
+        (chunks[0], None, chunks[0])
     }
 }
 
@@ -603,6 +591,32 @@ fn render_hex(
 
     let hex_block = Block::default();
     f.render_widget(Paragraph::new(lines).block(hex_block), area);
+}
+
+fn render_search_panel(
+    f: &mut ratatui::Frame,
+    viewer: &HexViewer,
+    input: &str,
+    area: Rect,
+) {
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    let prompt_area = chunks[0];
+    let help_area = chunks[1];
+
+    // Prompt line: "/" + input + optional error
+    let mut prompt_spans = vec![Span::raw("/")];
+    prompt_spans.push(Span::raw(input.to_string()));
+    if let Some(ref err) = viewer.search_error {
+        prompt_spans.push(Span::styled(
+            format!(" {}", err),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(prompt_spans)), prompt_area);
+
+    // Help line (now includes regex)
+    let help_text = "Hex: 48 65 6C 6C 6F   ASCII: \"Hello\"   Regex: /[Hh]ex/";
+    f.render_widget(Paragraph::new(help_text), help_area);
 }
 
 fn format_status(viewer: &HexViewer) -> String {
@@ -682,20 +696,29 @@ fn word_interpretation(viewer: &HexViewer, buffer: &[u8], vis_start: u128) -> St
 // ---------------------------------------------------------------------------
 // Search helpers
 // ---------------------------------------------------------------------------
-fn parse_search_pattern(input: &str) -> Result<Vec<u8>, String> {
+fn parse_search_pattern(input: &str) -> Result<SearchPattern, String> {
     let input = input.trim();
     if input.is_empty() {
         return Err("empty pattern".to_string());
     }
+    // Regex: /pattern/
+    if input.starts_with('/') && input.ends_with('/') && input.len() >= 2 {
+        let regex_str = &input[1..input.len() - 1];
+        match Regex::new(regex_str) {
+            Ok(re) => return Ok(SearchPattern::Regex(re)),
+            Err(e) => return Err(format!("regex error: {}", e)),
+        }
+    }
+    // ASCII: "text"
     if input.starts_with('"') && input.ends_with('"') && input.len() >= 2 {
         let ascii = &input[1..input.len() - 1];
         if ascii.is_ascii() {
-            return Ok(ascii.as_bytes().to_vec());
+            return Ok(SearchPattern::Exact(ascii.as_bytes().to_vec()));
         } else {
             return Err("ASCII string contains non-ASCII characters".to_string());
         }
     }
-    // Hex parsing
+    // Hex: whitespace‑separated hex bytes
     let hex_str: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     if hex_str.len() % 2 != 0 {
         return Err("hex string must have an even number of digits".to_string());
@@ -712,7 +735,7 @@ fn parse_search_pattern(input: &str) -> Result<Vec<u8>, String> {
             }
         }
     }
-    Ok(bytes)
+    Ok(SearchPattern::Exact(bytes))
 }
 
 fn search_step(viewer: &mut HexViewer) -> bool {
@@ -721,11 +744,15 @@ fn search_step(viewer: &mut HexViewer) -> bool {
         return false;
     }
 
-    let overlap = if viewer.pattern.is_empty() {
-        0
-    } else {
-        viewer.pattern.len() - 1
+    // Determine overlap size: for exact patterns use pattern length, for regex use constant
+    let overlap = match viewer.pattern {
+        Some(SearchPattern::Exact(ref pat)) => {
+            if pat.is_empty() { 0 } else { pat.len() - 1 }
+        }
+        Some(SearchPattern::Regex(_)) => MAX_REGEX_OVERLAP,
+        None => return false, // should not happen
     };
+
     let block_len = BLOCK_SIZE.min((viewer.file_size - viewer.search_offset) as usize);
 
     let bytes = match read_bytes_at(&mut viewer.file, viewer.search_offset, block_len) {
@@ -741,22 +768,35 @@ fn search_step(viewer: &mut HexViewer) -> bool {
         return false;
     }
 
+    // Build haystack: previous tail + new block
     let mut haystack = viewer.search_tail.clone();
     haystack.extend_from_slice(&bytes);
 
-    let finder = memmem::Finder::new(&viewer.pattern);
-    let matches: Vec<u128> = finder
-        .find_iter(&haystack)
-        .map(|pos| viewer.search_offset - viewer.search_tail.len() as u128 + pos as u128)
-        .collect();
+    let matches: Vec<u128> = match viewer.pattern {
+        Some(SearchPattern::Exact(ref pat)) => {
+            let finder = memmem::Finder::new(pat);
+            finder
+                .find_iter(&haystack)
+                .map(|pos| viewer.search_offset - viewer.search_tail.len() as u128 + pos as u128)
+                .collect()
+        }
+        Some(SearchPattern::Regex(ref re)) => {
+            re.find_iter(&haystack)
+                .map(|m| viewer.search_offset - viewer.search_tail.len() as u128 + m.start() as u128)
+                .collect()
+        }
+        None => Vec::new(),
+    };
 
     viewer.search_progress += bytes_len as u128;
 
+    // Update tail for next block
     if bytes_len >= overlap {
         viewer.search_tail = bytes[bytes_len - overlap..].to_vec();
     } else {
         viewer.search_tail.extend_from_slice(&bytes);
-        viewer.search_tail = viewer.search_tail[viewer.search_tail.len().saturating_sub(overlap)..].to_vec();
+        let tail_len = viewer.search_tail.len().min(overlap);
+        viewer.search_tail = viewer.search_tail[viewer.search_tail.len() - tail_len..].to_vec();
     }
 
     viewer.search_offset += bytes_len as u128;
@@ -845,8 +885,8 @@ fn main() -> io::Result<()> {
                                 }
                                 KeyCode::Enter => {
                                     match parse_search_pattern(input) {
-                                        Ok(pat) => {
-                                            viewer.pattern = pat;
+                                        Ok(pattern) => {
+                                            viewer.pattern = Some(pattern);
                                             viewer.search_offset = viewer.cursor + 1;
                                             viewer.search_progress = 0;
                                             viewer.search_matches.clear();
@@ -862,7 +902,7 @@ fn main() -> io::Result<()> {
                                 }
                                 KeyCode::Char(c) => {
                                     input.push(c);
-                                    viewer.search_error = None; // clear error on new input
+                                    viewer.search_error = None;
                                 }
                                 KeyCode::Backspace => {
                                     input.pop();
